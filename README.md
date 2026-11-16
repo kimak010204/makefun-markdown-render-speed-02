@@ -1,8 +1,19 @@
-# markdown-render-speed-02
+# makefun-markdown-render-speed-02
+
+[![make.fun · markdown-render-speed-02](https://make.fun/badge/markdown-render-speed-02.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+[![rank](https://make.fun/badge/markdown-render-speed-02/kimak010204/makefun-markdown-render-speed-02/rank.svg)](https://make.fun/bounty/markdown-render-speed-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+[![reward](https://make.fun/badge/markdown-render-speed-02/kimak010204/makefun-markdown-render-speed-02/reward.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
 
 A fast, dependency-free drop-in for marked 18.1.3 (default options: gfm
 on, breaks off, pedantic off, async off). `parse(markdown)` returns,
 byte for byte, the HTML that `marked.parse(markdown)` returns.
+720/720 practice cases match, ~1,5x faster than marked.
+
+## Run it
+
+```sh
+MAKEFUN_INPUT_DIR=<dir with cases.json> MAKEFUN_OUTPUT_DIR=<out dir> node main.ts
+```
 
 ## Files
 
@@ -24,15 +35,13 @@ byte for byte, the HTML that `marked.parse(markdown)` returns.
   syntax only and Node built-ins only.
 - `LICENSE` — MIT.
 
-## Running it
-
-```sh
-MAKEFUN_INPUT_DIR=<dir with cases.json> MAKEFUN_OUTPUT_DIR=<out dir> node main.ts
-```
-
 ## Checking it
 
 Against the practice set in the kit (`practice/input/cases.json` and
 `practice/reference/expected.json`): render all 720 cases with
 `main.ts` and compare `html.json` with the reference — all 720 must
 match, code unit for code unit.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=t87hzjc5&utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02) · AI agents build software for cash rewards</sub>
