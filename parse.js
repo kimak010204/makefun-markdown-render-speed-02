@@ -26,6 +26,8 @@ function isPunctCh(ch) {
 }
 
 function isBlankLine(s) {
+  // Loop per karakter kembali: versi regex (/[^ \t]/) terukur LEBIH
+  // LAMBAT di profil (baris umumnya pendek, test regex punya overhead).
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i);
     if (c !== 32 && c !== 9) return false;
@@ -47,7 +49,15 @@ function isTabOnly(s) {
 }
 
 // Hitung indent (kolom) dari awal baris; tab melompat ke kelipatan 4.
+// Baris tanpa indent awal (mayoritas: paragraf, heading, dll.) selalu
+// menghasilkan {cols:0, pos:0} — kembalikan satu objek bersama yang sama
+// (tidak ada pemanggil yang memutasi hasilnya) agar jutaan pemanggilan
+// per dokumen tidak mengalokasikan objek baru tiap kali.
+const INDENT_ZERO = { cols: 0, pos: 0 };
 function indentInfo(s) {
+  if (s.length === 0) return INDENT_ZERO;
+  const c0 = s.charCodeAt(0);
+  if (c0 !== 32 && c0 !== 9) return INDENT_ZERO;
   let cols = 0;
   let pos = 0;
   while (pos < s.length) {
@@ -164,37 +174,33 @@ function stripContainer(s, cols) {
 }
 
 // Escape &, <, >, ", ' tanpa pengecualian (untuk konten code & atribut mentah).
+// Fast path: kebanyakan string tidak mengandung karakter yang perlu di-escape —
+// satu pemindaian regex native jauh lebih murah daripada loop per karakter
+// di JS. Hanya bila ada yang cocok, replace native (satu pass) yang bekerja.
+const ESC_ALL_TEST_RE = /[&<>"']/;
+const ESC_ALL_RE = /[&<>"']/g;
+const ESC_ALL_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 function escAll(s) {
-  let out = '';
-  let start = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    let rep = null;
-    if (c === 38) rep = '&amp;';
-    else if (c === 60) rep = '&lt;';
-    else if (c === 62) rep = '&gt;';
-    else if (c === 34) rep = '&quot;';
-    else if (c === 39) rep = '&#39;';
-    if (rep !== null) {
-      out += s.slice(start, i) + rep;
-      start = i + 1;
-    }
-  }
-  return start === 0 ? s : out + s.slice(start);
+  if (!ESC_ALL_TEST_RE.test(s)) return s;
+  return s.replace(ESC_ALL_RE, (m) => ESC_ALL_MAP[m]);
 }
 
 // Escape untuk atribut/teks dengan & yang sadar entity: `&nama;` yang valid
 // dipertahankan apa adanya, entitas numerik valid di-decode lalu di-escape.
+// Lompat antar '&' dengan indexOf native (bukan loop per karakter): karakter
+// di antara dua '&' tidak pernah memulai entity, jadi hasilnya identik.
 function escEntityAware(s) {
   let out = '';
   let start = 0;
-  for (let i = 0; i < s.length; i++) {
-    if (s.charCodeAt(i) !== 38) continue;
+  let i = s.indexOf('&', start);
+  while (i !== -1) {
     const ent = tryEntity(s, i);
     if (ent) {
       out += escAll(s.slice(start, i)) + ent.text;
-      i = ent.end - 1;
       start = ent.end;
+      i = s.indexOf('&', ent.end);
+    } else {
+      i = s.indexOf('&', i + 1);
     }
   }
   // Sisa: escape & < > " '
@@ -245,7 +251,11 @@ function tryEntity(s, i) {
 // Encode href ala marked/cmark (houdini_escape_uri): encode kontrol, spasi,
 // " < > [ \ ] ^ ` { | }, DEL, dan non-ASCII (UTF-8). '%' dan karakter lain
 // dibiarkan apa adanya (encodeURI meng-encode '%', jadi tidak dipakai).
+// Fast path: sebagian besar href murni ASCII tanpa karakter yang perlu
+// di-encode — satu test regex native lalu kembalikan string apa adanya.
+const HREF_NEED_RE = /[\x00-\x20"<>\[\\\]^`{|}\x7F-\uFFFF]/;
 function encodeHref(s) {
+  if (!HREF_NEED_RE.test(s)) return s;
   let out = '';
   let start = 0;
   for (let i = 0; i < s.length; i++) {
@@ -812,6 +822,13 @@ const MASK_OT_RE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
 const MASK_BLOCKSKIP_RE = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
 
 function computeCodeRegions(s) {
+  // Fast path: region HANYA dicatat dari code-span (grup b blockSkip) —
+  // tanpa backtick di string, tidak ada region yang bisa terbentuk
+  // (replace OT + exec blockSkip tidak menghasilkan apa-apa). Dan region
+  // hanya dibaca di cabang delimiter — tanpa delimiter `*`/`_`/`~` di
+  // string, region tidak pernah dipakai.
+  if (s.indexOf('`') === -1) return [];
+  if (!/[*_~]/.test(s)) return [];
   const masked = s.replace(MASK_OT_RE, (m, run, esc) =>
     esc ? '+'.repeat(m.length)
       : run ? run + m.slice(run.length, -run.length).replace(/`/g, '+') + run
@@ -885,7 +902,45 @@ function findLinkTextEnd(s, start) {
   return scan(start);
 }
 
+// Pemindaian cepat teks polos di parseInline: karakter "struktural" yang
+// bisa memulai markup inline (\n \ ` & < [ ] * _ ~ ! @), plus pemicu
+// autolink GFM berbasis kata (www. / http(s):// case-insensitive /
+// mailto: / xmpp: case-sensitive). Regex native memindai jauh lebih cepat
+// daripada dispatch per karakter di JS; teks polos di antara dua posisi
+// spesial disalin sekaligus dengan slice.
+const INLINE_NEXT_RE = /[\n\\`&<\[\]*_~!@]|www\.|[hH][tT][tT][pP][sS]?:\/\/|mailto:|xmpp:/g;
+
+// Pemicu markup inline (untuk fast path teks polos di parseInline):
+// char-class native saja (backslash, backtick, '<', '[', '*', '_', '~',
+// '&', '@') — pemindaian regex alternasi penuh (dengan www./http/
+// mailto:/xmpp:/hard-break) ~2,4x lebih lambat di mikro-benchmark atas
+// paragraf doc asli. Pemicu autolink dicek terpisah dengan indexOf
+// (case-sensitive: www./mailto:/xmpp:) + regex kecil untuk skema
+// http(s):// (case-insensitive); hard break (/  +\n/) terakhir. Semua
+// cek dirangkai short-circuit sehingga paragraf yang mengandung pemicu
+// char-class (mayoritas) hanya membayar satu pemindaian char-class.
+const INLINE_TRIG_RE = /[\\`<\[*_~&@]/;
+const INLINE_HTTP_RE = /[hH][tT][tT][pP][sS]?:\/\//;
+const INLINE_HB_RE = /  +\n/;
+
 function parseInline(str, refs) {
+  // Fast path teks polos: tanpa karakter pemicu markup inline apa pun,
+  // tanpa pemicu autolink GFM (www./http(s)://mailto:/xmpp:), dan tanpa
+  // hard break (2+ spasi sebelum \n), output = escAll(str) langsung —
+  // jalur normal pun hanya mengumpulkan seluruh string ke satu node teks
+  // lalu me-rendernya, jadi hasilnya byte-identik. ']' / '!' / '>' polos
+  // aman (literal; escAll yang menangani '>'). \n dipertahankan sebagai
+  // soft break. Bila juga tanpa '>' '"' "'" ( & dan < sudah dikecualikan
+  // di atas), kembalikan string apa adanya tanpa alokasi sama sekali.
+  // Cek escape memakai indexOf (jauh lebih cepat dari regex /[>"']/).
+  if (!INLINE_TRIG_RE.test(str)
+    && str.indexOf('www.') === -1
+    && str.indexOf('mailto:') === -1
+    && str.indexOf('xmpp:') === -1
+    && !INLINE_HTTP_RE.test(str)
+    && !INLINE_HB_RE.test(str)) {
+    return str.indexOf('>') === -1 && str.indexOf('"') === -1 && str.indexOf("'") === -1 ? str : escAll(str);
+  }
   const s = str;
   const n = s.length;
   const nodes = [];
@@ -909,8 +964,11 @@ function parseInline(str, refs) {
   };
   // Akhir teks link per opener (findLinkTextEnd), di-cache per srcPos
   // karena dipakai cabang code-span dan handler ']' untuk opener yang sama.
-  const linkEndCache = new Map();
+  // Map dibuat malas (lazy): kebanyakan paragraf tanpa opener tidak pernah
+  // memakainya, jadi alokasi Map per parseInline dihindari.
+  let linkEndCache = null;
   const getLinkEnd = (srcPos) => {
+    if (linkEndCache === null) linkEndCache = new Map();
     let v = linkEndCache.get(srcPos);
     if (v === undefined) {
       v = findLinkTextEnd(s, srcPos);
@@ -929,7 +987,37 @@ function parseInline(str, refs) {
   while (i < n) {
     // Karakter di dalam autolink GFM yang dipulihkan penuh sudah menjadi
     // isi node; jangan dipindai ulang sebagai markup.
-    if (i < gfmExtendUntil) { i++; continue; }
+    if (i < gfmExtendUntil) { i = gfmExtendUntil; continue; }
+    // --- fast-forward teks polos ---
+    // Lompat ke karakter spesial berikutnya (regex native) dan salin
+    // seluruh run teks polos sekaligus ke buf. Pemicu autolink berbasis
+    // kata hanya menghentikan lompatan bila prevOk seperti di cabang
+    // autolink (awal / whitespace / tanda-baca ASCII) dan tidak ditekan
+    // suppressAutolink; bila tidak valid, pindai lanjut sesudah kata itu
+    // (di dalam kata pemicu tidak ada karakter spesial maupun pemicu
+    // lain, jadi aman dilewati). Penanganan karakter spesialnya sendiri
+    // tetap di cabang-cabang lama di bawah — perilaku tidak berubah.
+    INLINE_NEXT_RE.lastIndex = i;
+    let m = INLINE_NEXT_RE.exec(s);
+    while (m && m[0].length > 1) {
+      const p = m.index;
+      const prev = p > 0 ? s.charCodeAt(p - 1) : 32;
+      const prevOk = p === 0 || isSpaceCh(prev) || isAsciiPunct(prev);
+      let ok = false;
+      if (prevOk && !suppressAutolink) {
+        if (m[0] === 'www.' || m[0] === 'mailto:' || m[0] === 'xmpp:') ok = true;
+        else ok = httpSchemeLen(s, p) > 0;
+      }
+      if (ok) break;
+      INLINE_NEXT_RE.lastIndex = p + m[0].length;
+      m = INLINE_NEXT_RE.exec(s);
+    }
+    const next = m ? m.index : n;
+    if (next > i) {
+      buf += s.slice(i, next);
+      i = next;
+      continue;
+    }
     const c = s.charCodeAt(i);
     // --- newline: soft / hard break ---
     if (c === 10) {
@@ -1839,6 +1927,70 @@ function delimFlags(ch, before, after) {
 // __...*...__ (opener '*') atau **..._...** (opener '_'): alternatif
 // pertama regex RDelim marked menelan delimiter itu sebagai teks. R dan o
 // dari node tetangga opener.
+// Kumpulkan runId milik wrap (em/strong/del) mulai dari satu node
+// (rekursif ke kids) ke array `out` — delim dengan runId ini adalah residu
+// run wrap dan dilewati saat mengumpulkan run delimiter (run penuh dari
+// wrap yang mewakili). Array polos + indexOf: wrap biasanya 0-3 buah,
+// jauh lebih murah daripada Set baru per panggilan gate.
+function collectWrapRunIdsNode(nd, out) {
+  if (nd.t === 'em' || nd.t === 'strong' || nd.t === 'del') {
+    if (nd.openRun) out.push(nd.openRun.runId);
+    if (nd.closeRun) out.push(nd.closeRun.runId);
+    const kids = nd.kids || [];
+    for (let q = 0; q < kids.length; q++) collectWrapRunIdsNode(kids[q], out);
+  } else if (nd.kids) {
+    const kids = nd.kids;
+    for (let q = 0; q < kids.length; q++) collectWrapRunIdsNode(kids[q], out);
+  }
+}
+
+// Kumpulkan run delimiter terlihat mulai dari satu node (rekursif ke
+// kids) — satu run mentah hanya sekali, dengan panjang run PENUH (n
+// terbesar di antara entri-entri run itu). `runById` = Map keyed by runId
+// (runId adalah counter global yang tumbuh besar — objek polos dengan key
+// int besar jatuh ke dictionary mode V8 dan jauh lebih lambat dari Map),
+// `runOrder` = urutan kemunculan pertama. Entri wrap (openRun/closeRun)
+// dipakai apa adanya tanpa salinan spread; field `node` tidak dipakai
+// gate, jadi tidak disimpan.
+function collectDelimRunsNode(nd, wrapRunIds, runById, runOrder) {
+  if (nd.t === 'delim') {
+    if (nd.runId != null && !nd.masked && wrapRunIds.indexOf(nd.runId) === -1) {
+      const prev = runById.get(nd.runId);
+      if (prev === undefined) {
+        runById.set(nd.runId, { ch: nd.ch, n: nd.n, open: nd.open, close: nd.close, runId: nd.runId });
+        runOrder.push(nd.runId);
+      } else if (nd.n > prev.n) {
+        runById.set(nd.runId, { ch: nd.ch, n: nd.n, open: nd.open, close: nd.close, runId: nd.runId });
+      }
+    }
+    return;
+  }
+  if (nd.t === 'em' || nd.t === 'strong' || nd.t === 'del') {
+    if (nd.openRun && nd.openRun.runId != null) {
+      const e = nd.openRun;
+      const prev = runById.get(e.runId);
+      if (prev === undefined) {
+        runById.set(e.runId, e);
+        runOrder.push(e.runId);
+      } else if (e.n > prev.n) {
+        runById.set(e.runId, e);
+      }
+    }
+    const kids = nd.kids || [];
+    for (let q = 0; q < kids.length; q++) collectDelimRunsNode(kids[q], wrapRunIds, runById, runOrder);
+    if (nd.closeRun && nd.closeRun.runId != null) {
+      const e = nd.closeRun;
+      const prev = runById.get(e.runId);
+      if (prev === undefined) {
+        runById.set(e.runId, e);
+        runOrder.push(e.runId);
+      } else if (e.n > prev.n) {
+        runById.set(e.runId, e);
+      }
+    }
+  }
+}
+
 function emStrongGate(nodes, oi, ci) {
   const opener = nodes[oi];
   const closer = nodes[ci];
@@ -1847,66 +1999,33 @@ function emStrongGate(nodes, oi, ci) {
   // wrap tetap dihitung (dari openRun/closeRun wrap), dan satu run mentah
   // hanya dihitung sekali (dedup runId) meski terpecah jadi residu di
   // dalam/ sesudah wrap. Anak link/img/code/html tidak terlihat.
-  // Pre-pass: runId yang dimiliki wrap — delim dengan runId itu adalah
-  // residu run wrap tersebut dan dilewati (run penuh dari wrap yang
-  // mewakili, agar aritmetika m memakai panjang run penuh seperti scan
-  // marked, bukan sisa residu).
-  const wrapRunIds = new Set();
-  const collectWrapRuns = (list) => {
-    for (const nd of list) {
-      if (nd.t === 'em' || nd.t === 'strong' || nd.t === 'del') {
-        if (nd.openRun) wrapRunIds.add(nd.openRun.runId);
-        if (nd.closeRun) wrapRunIds.add(nd.closeRun.runId);
-        collectWrapRuns(nd.kids || []);
-      } else if (nd.kids) {
-        collectWrapRuns(nd.kids);
-      }
-    }
-  };
-  for (let q = oi + 1; q < nodes.length; q++) collectWrapRuns([nodes[q]]);
-  const all = [];
-  // Dedup runId: satu run mentah hanya dihitung sekali, dengan panjang
-  // run PENUH (n terbesar di antara entri-entri run itu — wrap bisa
-  // mencatat run yang sama dengan n residu, mis. closeRun em n=1 vs
-  // closeRun strong n=3 untuk run yang sama). Posisi = kemunculan pertama.
+  // Versi ini sama persis logikanya dengan sebelumnya, hanya tanpa
+  // alokasi Set/Map/closure/spread/filter per panggilan (gate dipanggil
+  // untuk tiap pasangan opener×closer di processEmphasis).
+  const wrapRunIds = [];
+  for (let q = oi + 1; q < nodes.length; q++) collectWrapRunIdsNode(nodes[q], wrapRunIds);
   const runById = new Map();
   const runOrder = [];
-  const emitRun = (entry) => {
-    if (entry.runId == null) return;
-    const prev = runById.get(entry.runId);
-    if (!prev) {
-      runById.set(entry.runId, entry);
-      runOrder.push(entry.runId);
-    } else if (entry.n > prev.n) {
-      runById.set(entry.runId, entry);
-    }
-  };
-  const collectAll = (list) => {
-    for (const nd of list) {
-      if (nd.t === 'delim') {
-        if (!nd.masked && !wrapRunIds.has(nd.runId)) emitRun({ ch: nd.ch, n: nd.n, open: nd.open, close: nd.close, runId: nd.runId, node: nd });
-      } else if (nd.t === 'em' || nd.t === 'strong' || nd.t === 'del') {
-        if (nd.openRun) emitRun({ ...nd.openRun, node: null });
-        collectAll(nd.kids || []);
-        if (nd.closeRun) emitRun({ ...nd.closeRun, node: null });
-      }
-    }
-  };
-  for (let q = oi + 1; q < nodes.length; q++) collectAll([nodes[q]]);
-  for (const id of runOrder) all.push(runById.get(id));
+  for (let q = oi + 1; q < nodes.length; q++) collectDelimRunsNode(nodes[q], wrapRunIds, runById, runOrder);
+  const all = new Array(runOrder.length);
+  for (let q = 0; q < runOrder.length; q++) all[q] = runById.get(runOrder[q]);
   // Closer harus tampak sebagai run di jangkauan (lewat node-nya sendiri
   // atau lewat run wrap yang memakainya).
-  const closerEntry = all.find((d) => d.runId === closer.runId);
+  let closerEntry = null;
+  for (let q = 0; q < all.length; q++) {
+    if (all[q].runId === closer.runId) { closerEntry = all[q]; break; }
+  }
   if (!closerEntry) return null;
   if (opener.ch === '~') {
     // Simulasi del marked: kandidat hanya run dengan panjang efektif ==
     // o (grup RDelim (~~?) maks 2 char); open-only → p += o; lainnya
     // (close-only/both) → p -= o; tanpa rule-of-3/R/o-break. Berpasangan
     // di delimiter pertama tempat p <= 0. Retry k dari n ke 1.
-    const simDel = all.filter((d) => d.ch === '~');
     for (let k = opener.n; k >= 1; k--) {
       let p = k;
-      for (const D of simDel) {
+      for (let q = 0; q < all.length; q++) {
+        const D = all[q];
+        if (D.ch !== '~') continue;
         const l = Math.min(D.n, 2);
         if (l !== k) continue;
         if (D.open && !D.close) {
@@ -1938,7 +2057,6 @@ function emStrongGate(nodes, oi, ci) {
       skipRunId = a1.runId;
     }
   }
-  const sim = all.filter((d) => d.ch === opener.ch && d.runId !== skipRunId);
   // R dan o dari node tetangga opener.
   const p = oi > 0 ? lastCharOf(nodes[oi - 1]) : '';
   const nextCh = oi + 1 < nodes.length ? firstCharOf(nodes[oi + 1]) : '';
@@ -1954,7 +2072,9 @@ function emStrongGate(nodes, oi, ci) {
     let mAtPair = 0;
     let fAtPair = 0;
     let broke = false;
-    for (const D of sim) {
+    for (let q = 0; q < all.length; q++) {
+      const D = all[q];
+      if (D.ch !== opener.ch || D.runId === skipRunId) continue;
       const both = D.open && D.close;
       const openOnly = D.open && !D.close;
       const closeOnly = !D.open && D.close;
@@ -2064,7 +2184,9 @@ function processEmphasis(nodes) {
           // dalam (ditokenisasi ulang bersama kids), sisa closer (b-use)
           // jadi delimiter di AKHIR teks dalam, sisa closer (run-b) jadi
           // delimiter SESUDAH wrap.
-          const innerKids = kids.slice();
+          // kids sudah slice segar dari nodes (tidak dipakai lagi setelah
+          // ini) — pakai langsung sebagai innerKids tanpa salinan kedua.
+          const innerKids = kids;
           const { k, b } = gateRes;
           if (k > use) {
             const afterCh = innerKids.length > 0 ? firstCharOf(innerKids[0]) : '';
@@ -2083,8 +2205,6 @@ function processEmphasis(nodes) {
           wrap.openRun = { ch: opener.ch, n: opener.n, open: opener.open, close: opener.close, runId: opener.runId };
           wrap.closeRun = { ch: closer.ch, n: closer.n, open: closer.open, close: closer.close, runId: closer.runId };
           // Sisa delimiter opener/closer.
-          const before = nodes.slice(0, oi);
-          const after = nodes.slice(ci + 1);
           const mid = [];
           if (opener.n > k) {
             // (n-k) karakter awal run dikonsumsi sebagai teks literal.
@@ -2097,8 +2217,9 @@ function processEmphasis(nodes) {
             if (closer.skipped) right.skipped = new Set(closer.skipped);
             mid.push(right);
           }
-          nodes.length = 0;
-          nodes.push(...before, ...mid, ...after);
+          // Ganti nodes[oi..ci] dengan mid secara in-place (splice native)
+          // — tanpa slice before/after + rebuild array + push-spread.
+          nodes.splice(oi, ci - oi + 1, ...mid);
           changed = true;
           break;
         }
@@ -2179,25 +2300,39 @@ function fenceInfo(line, pos) {
   return { ch: String.fromCharCode(ch), len, info, indent: indentInfo(line).cols };
 }
 
+// Cocokkan `word` (huruf kecil) di line mulai pos, case-insensitive,
+// tanpa slice/toLowerCase (tanpa alokasi). HANYA huruf A-Z yang
+// dibandingkan case-insensitive — `| 32` mentah merusak simbol
+// ('[' | 32 = '{').
+function startsWithCI(line, pos, word) {
+  for (let q = 0; q < word.length; q++) {
+    if (pos + q >= line.length) return false;
+    const a = line.charCodeAt(pos + q);
+    const b = word.charCodeAt(q);
+    if (a !== b && !(a >= 65 && a <= 90 && a + 32 === b)) return false;
+  }
+  return true;
+}
+
 // Jenis HTML block 1-7 mulai di line[pos]==='<' (indent < 4). null bila bukan.
+// Ditulis ulang tanpa `line.slice(pos).toLowerCase()` — versi lama
+// mengalokasikan dua string penuh per baris yang diawali '<'.
 function htmlBlockType(line, pos) {
   if (line.charCodeAt(pos) !== 60) return 0;
-  const rest = line.slice(pos);
-  const low = rest.toLowerCase();
   // Tipe 1: script/pre/style/textarea
   for (const tag of ['script', 'pre', 'style', 'textarea']) {
-    if (low.startsWith('<' + tag)) {
-      const after = low[1 + tag.length];
-      if (after === undefined || after === ' ' || after === '\t' || after === '>') return 1;
+    if (startsWithCI(line, pos, '<' + tag)) {
+      const after = pos + 1 + tag.length >= line.length ? undefined : line.charCodeAt(pos + 1 + tag.length);
+      if (after === undefined || after === 32 || after === 9 || after === 62) return 1;
     }
   }
-  if (low.startsWith('<!--')) return 2;
-  if (low.startsWith('<?')) return 3;
-  if (low.startsWith('<!') && low.length > 2) {
-    const d = low.charCodeAt(2);
+  if (line.startsWith('<!--', pos)) return 2;
+  if (line.startsWith('<?', pos)) return 3;
+  if (line.startsWith('<!', pos) && pos + 2 < line.length) {
+    const d = line.charCodeAt(pos + 2);
     if ((d >= 65 && d <= 90) || (d >= 97 && d <= 122)) return 4;
   }
-  if (low.startsWith('<![cdata[')) return 5;
+  if (startsWithCI(line, pos, '<![cdata[')) return 5;
   // Tipe 6: tag blok
   let tagName = '';
   let k = pos + 1;
@@ -2228,12 +2363,13 @@ function htmlBlockType(line, pos) {
 function htmlBlockEnds(line, type) {
   switch (type) {
     case 1: {
-      const low = line.toLowerCase();
+      // Regex sudah /i — tanpa toLowerCase (versi lama mengalokasikan
+      // salinan lowercase seluruh baris) dan tanpa pre-check includes.
       return (
-        (low.includes('</script') && SCRIPT_END.test(line)) ||
-        (low.includes('</pre') && PRE_END.test(line)) ||
-        (low.includes('</style') && STYLE_END.test(line)) ||
-        (low.includes('</textarea') && TEXTAREA_END.test(line))
+        SCRIPT_END.test(line) ||
+        PRE_END.test(line) ||
+        STYLE_END.test(line) ||
+        TEXTAREA_END.test(line)
       );
     }
     case 2:
@@ -2436,6 +2572,15 @@ function tableAlign(cell) {
 
 // ---------- marker list ----------
 
+// Apakah karakter pertama (setelah indent) bisa memulai marker list?
+// Marker hanya diawali '-', '+', '*', atau digit. Guard murah sebelum
+// parseMarker (yang memindai indent + digit + whitespace) — sebagian besar
+// baris bukan marker, dan parseMarker dipanggil dari banyak tempat panas
+// (wouldInterruptParagraph, scanRefs, collectListItems, classify).
+function couldBeMarker(c) {
+  return c === 45 || c === 43 || c === 42 || (c >= 48 && c <= 57);
+}
+
 function parseMarker(line, expectedCols) {
   // Guard: baris yang bukan string (mis. akses di luar range saat
   // mengumpulkan item list) bukan marker.
@@ -2521,8 +2666,10 @@ function isParaContinuationLine(line) {
   return !wouldInterruptParagraph(line);
 }
 
-function wouldInterruptParagraph(line) {
-  const info = indentInfo(line);
+function wouldInterruptParagraph(line, info) {
+  // info opsional: pemanggil yang sudah menghitung indentInfo(line) boleh
+  // meneruskannya agar tidak dihitung dua kali untuk baris yang sama.
+  info = info || indentInfo(line);
   if (info.cols >= 4) return false;
   const pos = info.pos;
   if (pos >= line.length) return false;
@@ -2535,7 +2682,7 @@ function wouldInterruptParagraph(line) {
     if (t >= 1 && t <= 6) return true;
   }
   if (c === 62) return true;
-  const m = parseMarker(line);
+  const m = couldBeMarker(c) ? parseMarker(line) : null;
   if (m) {
     if (!m.empty) {
       if (!m.ordered) return true;
@@ -2549,7 +2696,13 @@ function wouldInterruptParagraph(line) {
 // marker seperti ini BOLEH memutus paragraf (marked/cmark: sublist
 // terbentuk), sedangkan di top-level / blockquote TIDAK (wouldInterrupt
 // mengembalikan false). Dipakai bersama inListItem di renderBlocks.
-function isOrderedListNonOne(line) {
+function isOrderedListNonOne(line, info) {
+  // Marker ordered harus diawali digit; parseMarker sendiri menolak
+  // indent >= 4 (expectedCols undefined).
+  info = info || indentInfo(line);
+  if (info.cols >= 4) return false;
+  const c = line.charCodeAt(info.pos);
+  if (c < 48 || c > 57) return false;
   const m = parseMarker(line);
   return !!(m && m.ordered && !m.empty && m.start !== 1);
 }
@@ -2576,7 +2729,7 @@ function isLazyContinuationLine(line) {
     if (t >= 1 && t <= 6) return false;
   }
   if (c === 62) return false;
-  if (parseMarker(line)) return false;
+  if (couldBeMarker(c) && parseMarker(line)) return false;
   return true;
 }
 
@@ -2599,7 +2752,7 @@ function lineEndsInPara(s, prevInPara) {
       cur = stripped;
       continue;
     }
-    const m = parseMarker(cur);
+    const m = couldBeMarker(cur.charCodeAt(pos)) ? parseMarker(cur) : null;
     if (m) {
       if (m.empty) return false;
       cur = stripCols(cur, m.contentIndent);
@@ -2701,7 +2854,7 @@ function scanParagraphEnd(lines, i, b, inListItem = false) {
         break;
       }
     }
-    if (wouldInterruptParagraph(l) || (inListItem && isOrderedListNonOne(l))) break;
+    if (wouldInterruptParagraph(l, li) || (inListItem && isOrderedListNonOne(l, li))) break;
     j++;
   }
   return j;
@@ -2721,7 +2874,10 @@ function scanRefs(lines, a, b, refs, inListItem = false) {
     }
     const info = indentInfo(line);
     const pos = info.pos;
-    if (info.cols < 4) {
+    // Ref-def harus diawali '[' (setelah indent) — tryRefDef sendiri
+    // mengembalikan null bila bukan '['; guard murah ini menghindarinya
+    // melakukan slice+join sampai 64 baris untuk baris biasa.
+    if (info.cols < 4 && line.charCodeAt(pos) === 91) {
       const def = tryRefDef(lines, i, b);
       if (def) {
         if (!refs.has(def.label)) refs.set(def.label, { dest: def.dest, title: def.title });
@@ -2763,7 +2919,7 @@ function scanRefs(lines, a, b, refs, inListItem = false) {
       continue;
     }
     if (info.cols < 4) {
-      const mk = parseMarker(line);
+      const mk = couldBeMarker(line.charCodeAt(pos)) ? parseMarker(line) : null;
       if (mk) {
         const lst = collectListItems(lines, i, b, mk.typeKey);
         if (lst) {
@@ -2792,8 +2948,8 @@ function renderBlocks(lines, a, b, refs, paraTight, firstParaPrefix, inContainer
     }
     const info = indentInfo(line);
     const pos = info.pos;
-    // Link reference definition.
-    if (info.cols < 4) {
+    // Link reference definition (guard '[' — lihat scanRefs).
+    if (info.cols < 4 && line.charCodeAt(pos) === 91) {
       const def = tryRefDef(lines, i, b);
       if (def) {
         if (!refs.has(def.label)) refs.set(def.label, { dest: def.dest, title: def.title });
@@ -2972,8 +3128,9 @@ function renderBlocks(lines, a, b, refs, paraTight, firstParaPrefix, inContainer
       i = q.end;
       continue;
     }
-    // List.
-    if (info.cols < 4) {
+    // List (guard karakter marker — parseList dipanggil untuk hampir
+    // tiap baris paragraf; tanpa guard ia memanggil parseMarker sia-sia).
+    if (info.cols < 4 && couldBeMarker(line.charCodeAt(pos))) {
       const lst = parseList(lines, i, b, refs);
       if (lst) {
         out += lst.html;
@@ -3047,7 +3204,7 @@ function renderBlocks(lines, a, b, refs, paraTight, firstParaPrefix, inContainer
             break;
           }
         }
-        if (wouldInterruptParagraph(l) || (inListItem && isOrderedListNonOne(l))) break;
+        if (wouldInterruptParagraph(l, li) || (inListItem && isOrderedListNonOne(l, li))) break;
         pLines.push(paraLine(l, j, li.cols));
         j++;
       }
@@ -3202,7 +3359,7 @@ function collectListItems(lines, i, b, key) {
     if (k >= b) break;
     const hk = indentInfo(lines[k]);
     if (hk.cols < 4 && isHrLine(lines[k], hk.pos)) break;
-    const m = parseMarker(lines[k]);
+    const m = couldBeMarker(lines[k].charCodeAt(hk.pos)) ? parseMarker(lines[k]) : null;
     if (!m || m.typeKey !== key) break;
     if (k > j && items.length > 0) loose = true;
     j = k;
@@ -3263,7 +3420,7 @@ function collectListItems(lines, i, b, key) {
       // Quote / list: berakhir di paragraf bila baris terdalamnya paragraf
       // (mis. '> Blockquote' berisi paragraf -> lazy continuation boleh).
       if (c === 62) return lineEndsInPara(s, state === 'para') ? 'para' : 'other';
-      if (parseMarker(s)) return lineEndsInPara(s, state === 'para') ? 'para' : 'other';
+      if (couldBeMarker(c) && parseMarker(s)) return lineEndsInPara(s, state === 'para') ? 'para' : 'other';
       if (setextLevel(s, p) > 0) return 'other';
       if (isTableDelimiter(s, p)) return 'other';
       return 'para';
@@ -3308,7 +3465,7 @@ function collectListItems(lines, i, b, key) {
       // Indent < contentIndent: hr mengalahkan item, lalu marker apa pun
       // (tipe berbeda) mengakhiri list.
       if (li.cols < 4 && isHrLine(line, li.pos)) break;
-      if (parseMarker(line)) break;
+      if (couldBeMarker(line.charCodeAt(li.pos)) && parseMarker(line)) break;
       // Di dalam fenced code yang SUDAH punya konten: baris konten (termasuk
       // yang indent-nya < contentIndent) tetap bagian item, ditambahkan
       // mentah (tanpa strip contentIndent). Bila fence belum punya konten,
@@ -3370,8 +3527,8 @@ function itemHasBlankBetweenBlocks(lines) {
     }
     const info = indentInfo(lines[i]);
     const pos = info.pos;
-    // Ref-def: sebuah blok (konsumsi baris-barisnya).
-    if (info.cols < 4) {
+    // Ref-def: sebuah blok (konsumsi baris-barisnya). Guard '[' — lihat scanRefs.
+    if (info.cols < 4 && lines[i].charCodeAt(pos) === 91) {
       const def = tryRefDef(lines, i, b);
       if (def) {
         if (seenBlank && seenBlock) return true;
@@ -3386,14 +3543,16 @@ function itemHasBlankBetweenBlocks(lines) {
     seenBlank = false;
     // Lewati blok ini.
     let end;
+    let pm = null;
     if (info.cols < 4 && atxInfo(lines[i], pos)) end = i + 1;
     else if (info.cols < 4 && fenceInfo(lines[i], pos)) end = skipFence(lines, i, b, fenceInfo(lines[i], pos));
     else if (info.cols >= 4) end = skipIndentedCode(lines, i, b);
     else if (info.cols < 4 && htmlBlockType(lines[i], pos) > 0) end = skipHtmlBlock(lines, i, b, htmlBlockType(lines[i], pos));
     else if (info.cols < 4 && isHrLine(lines[i], pos)) end = i + 1;
     else if (info.cols < 4 && lines[i].charCodeAt(pos) === 62) end = collectQuote(lines, i, b).end;
-    else if (info.cols < 4 && parseMarker(lines[i])) {
-      const lst = collectListItems(lines, i, b, parseMarker(lines[i]).typeKey);
+    else if (info.cols < 4 && couldBeMarker(lines[i].charCodeAt(pos)) && (pm = parseMarker(lines[i]))) {
+      // parseMarker dipanggil sekali saja — typeKey diambil dari hasil yang sama.
+      const lst = collectListItems(lines, i, b, pm.typeKey);
       end = lst ? lst.end : i + 1;
     } else end = scanParagraphEnd(lines, i, b, true);
     // Mundur melewati baris kosong akhir yang dikonsumsi blok (mis. trailing
@@ -3452,7 +3611,7 @@ function firstBlockIsParagraph(itemLines, refs) {
   if (isBlankLine(line)) return false;
   const info = indentInfo(line);
   if (info.cols >= 4) return false;
-  if (tryRefDef(itemLines, 0, itemLines.length)) return false;
+  if (line.charCodeAt(info.pos) === 91 && tryRefDef(itemLines, 0, itemLines.length)) return false;
   const pos = info.pos;
   const c = line.charCodeAt(pos);
   if (c === 35 && atxInfo(line, pos)) return false;
@@ -3463,7 +3622,7 @@ function firstBlockIsParagraph(itemLines, refs) {
     if (t >= 1 && t <= 6) return false;
   }
   if (c === 62) return false;
-  if (parseMarker(line)) return false;
+  if (couldBeMarker(c) && parseMarker(line)) return false;
   return true;
 }
 
@@ -3479,6 +3638,8 @@ export function parse(markdown) {
   if (trailingNL && lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
   const refs = new Map();
   // Kumpulkan SEMUA definisi referensi dulu (forward reference berlaku).
-  scanRefs(lines, 0, lines.length, refs);
+  // Ref-def harus diawali '[' — tanpa '[' di input, tidak ada yang bisa
+  // dikumpulkan, lewati seluruh pemindaian scanRefs.
+  if (s.indexOf('[') !== -1) scanRefs(lines, 0, lines.length, refs);
   return renderBlocks(lines, 0, lines.length, refs, false, null, false, trailingNL, false);
 }
